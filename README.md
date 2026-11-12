@@ -217,15 +217,11 @@ The small workload was validation-oriented and included rejected records. These 
 
 Automated tests are implemented using pytest.
 
-The latest reported test execution completed with:
+- Total automated tests: 94
+- Tests passed: 94
+- Tests failed: 0
 
-- Total tests passed: 99
-- Failed tests: 0
-
-The test suite covers validation, ingestion, database operations, publishing, and transformation.
-
-Run tests using:
-
+The project also includes standalone manual verification scripts in the `scripts/` directory.
 ```bash
 python -m pytest -v
 ```
