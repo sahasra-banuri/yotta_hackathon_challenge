@@ -303,3 +303,52 @@ def update_pipeline_run(
     )
 
     session.flush()
+
+# ==========================================
+# 7. RECONCILE PRODUCT CATALOGUE SNAPSHOT
+# ==========================================
+
+def reconcile_product_snapshot(
+    session,
+    present_product_ids: set[str],
+    active_product_ids: set[str]
+) -> int:
+    """
+    Reconcile the database with the latest authoritative
+    product catalogue snapshot.
+
+    Products missing from the snapshot become INACTIVE.
+    Products present but marked INACTIVE remain INACTIVE.
+    Products present and marked ACTIVE remain ACTIVE.
+
+    Products are never deleted.
+    """
+
+    if not present_product_ids:
+        raise ValueError(
+            "Cannot reconcile an empty or invalid product snapshot."
+        )
+
+    if not active_product_ids.issubset(present_product_ids):
+        raise ValueError(
+            "Active products must belong to the current snapshot."
+        )
+
+    # Deactivate products absent from the current active snapshot.
+    session.execute(
+        update(Product).values(status="INACTIVE")
+    )
+
+    # Reactivate only products marked ACTIVE in the snapshot.
+    active_ids = list(active_product_ids)
+
+    for start in range(0, len(active_ids), 500):
+        batch = active_ids[start:start + 500]
+
+        session.execute(
+            update(Product)
+            .where(Product.product_id.in_(batch))
+            .values(status="ACTIVE")
+        )
+
+    return len(present_product_ids)

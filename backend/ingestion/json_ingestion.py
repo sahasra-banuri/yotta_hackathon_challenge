@@ -12,10 +12,13 @@ def read_json_in_batches(
 
     file_path = Path(file_path)
 
-    if not file_path.exists():
+    if not file_path.is_file():
         raise FileNotFoundError(
             f"JSON file not found: {file_path}"
         )
+
+    if file_path.stat().st_size == 0:
+        raise ValueError("Orders JSON file is physically empty.")
 
     if batch_size <= 0:
         raise ValueError("Batch size must be greater than zero.")
@@ -23,6 +26,19 @@ def read_json_in_batches(
     try:
         with open(file_path, "rb") as file:
 
+            parser = ijson.parse(file)
+
+            try:
+                _, event, _ = next(parser)
+            except StopIteration:
+                raise ValueError("JSON file contains no data.")
+
+            if event != "start_array":
+                raise ValueError(
+                    "Orders JSON must contain a top-level array."
+                )
+
+            file.seek(0)
             records = ijson.items(file, "item")
 
             while True:

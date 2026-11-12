@@ -12,7 +12,6 @@ def validate_order(
 
     errors = []
 
-    # 1. Validate order ID
     order_id = str(record.get("order_id") or "").strip()
 
     if not order_id:
@@ -21,10 +20,7 @@ def validate_order(
     elif order_id in seen_order_ids:
         errors.append(f"Duplicate order ID: {order_id}")
 
-    else:
-        seen_order_ids.add(order_id)
-
-    # 2. Validate order date
+    # Validate order date
     try:
         order_date = date.fromisoformat(
             str(record.get("order_date", "")).strip()
@@ -33,7 +29,7 @@ def validate_order(
         order_date = None
         errors.append("Invalid order date.")
 
-    # 3. Validate order status
+    # Validate order status
     order_status = str(
         record.get("order_status") or ""
     ).strip().upper()
@@ -41,7 +37,7 @@ def validate_order(
     if order_status not in VALID_ORDER_STATUSES:
         errors.append(f"Invalid order status: {order_status}")
 
-    # 4. Validate items
+    # Validate order items
     items = record.get("items")
 
     if not isinstance(items, list) or not items:
@@ -62,17 +58,17 @@ def validate_order(
 
         item_errors = []
 
-        # Validate product ID
         product_id = str(
             item.get("product_id") or ""
         ).strip()
 
+        # Product reference validation
         if not product_id:
             item_errors.append("Product ID is missing.")
 
         elif product_id not in valid_product_ids:
             item_errors.append(
-                f"Unknown product ID: {product_id}"
+                f"Unknown product ID or inactive product: {product_id}"
             )
 
         elif product_id in seen_item_product_ids:
@@ -83,7 +79,7 @@ def validate_order(
         else:
             seen_item_product_ids.add(product_id)
 
-        # Validate quantity
+        # Quantity validation
         try:
             raw_quantity = item.get("quantity")
 
@@ -106,7 +102,7 @@ def validate_order(
                 "Quantity must be a positive integer."
             )
 
-        # Validate unit price
+        # Unit price validation
         try:
             unit_price = Decimal(
                 str(item.get("unit_price", "")).strip()
@@ -117,9 +113,9 @@ def validate_order(
                     "Unit price must be a finite number."
                 )
 
-            elif unit_price < 0:
+            elif unit_price <= 0:
                 item_errors.append(
-                    "Unit price cannot be negative."
+                    "Unit price must be greater than zero."
                 )
 
         except (InvalidOperation, ValueError):
@@ -128,12 +124,17 @@ def validate_order(
                 "Unit price must be a valid number."
             )
 
+        # Reject invalid items
         if item_errors:
             errors.extend(
-                [f"Item {index}: {error}" for error in item_errors]
+                [
+                    f"Item {index}: {error}"
+                    for error in item_errors
+                ]
             )
             continue
 
+        # Calculate item total
         item_total = quantity * unit_price
         total_amount += item_total
 
@@ -144,16 +145,17 @@ def validate_order(
             "item_total": item_total
         })
 
-    # 5. Return validation result
+    # Reject the entire order if any validation failed
     if errors:
         return None, errors
 
-    valid_order = {
+    # Reserve order ID only after successful validation
+    seen_order_ids.add(order_id)
+
+    return {
         "order_id": order_id,
         "order_date": order_date,
         "order_status": order_status,
         "items": validated_items,
         "total_amount": total_amount
-    }
-
-    return valid_order, []
+    }, []

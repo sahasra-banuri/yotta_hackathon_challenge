@@ -13,11 +13,11 @@ from sqlalchemy import select
 from backend.config import (
     SAMPLE_DATA_DIR,
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_JSON_BATCH_SIZE
+    DEFAULT_JSON_BATCH_SIZE,
+    STALE_RUN_TIMEOUT_MINUTES
 )
 
 from backend.database.connection import SessionLocal
-
 from backend.database.models import PipelineRun
 
 from backend.database.publisher import (
@@ -25,7 +25,8 @@ from backend.database.publisher import (
     update_pipeline_run,
     publish_products,
     publish_orders,
-    publish_rejected_records
+    publish_rejected_records,
+    reconcile_product_snapshot
 )
 
 from backend.ingestion.csv_ingestion import read_csv_in_chunks
@@ -39,17 +40,23 @@ from backend.processing.transform import (
     transform_order
 )
 
-def utc_now():
-    """
-    Return current UTC time as a timezone-naive datetime.
-
-    SQLite CURRENT_TIMESTAMP stores UTC timestamps without
-    timezone information, so we use the same representation.
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ==========================================
-# 1. LOGGING
+# 1. TIME
+# ==========================================
+
+def utc_now():
+    """
+    Return timezone-naive UTC time.
+
+    This matches SQLite CURRENT_TIMESTAMP representation.
+    """
+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ==========================================
+# 2. LOGGING
 # ==========================================
 
 logging.basicConfig(
@@ -61,15 +68,13 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 2. FILE CHECKSUM
+# 3. FILE CHECKSUM
 # ==========================================
 
 def calculate_checksum(file_path: Path) -> str:
     """
-    Calculate SHA-256 checksum for a file.
-
-    Reading the file in chunks avoids loading
-    the entire file into memory.
+    Calculate SHA-256 checksum without loading
+    the complete file into memory.
     """
 
     sha256 = hashlib.sha256()
@@ -93,7 +98,7 @@ def calculate_combined_checksum(
     orders_path: Path
 ) -> str:
     """
-    Generate one checksum representing both input files.
+    Generate a checksum representing both input files.
     """
 
     combined = hashlib.sha256()
@@ -109,13 +114,10 @@ def calculate_combined_checksum(
 
 
 # ==========================================
-# 3. MEMORY MONITORING
+# 4. MEMORY MONITORING
 # ==========================================
 
 def get_memory_usage_mb() -> float:
-    """
-    Return current process memory usage in MB.
-    """
 
     process = psutil.Process()
 
@@ -123,16 +125,19 @@ def get_memory_usage_mb() -> float:
 
     return memory_bytes / (1024 * 1024)
 
+
+# ==========================================
+# 5. STALE RUN RECOVERY
+# ==========================================
+
 def recover_stale_runs(session):
     """
-    Identify pipeline executions that have remained RUNNING
-    beyond the configured timeout.
+    Mark executions that exceeded the configured
+    RUNNING timeout as ABANDONED.
 
-    Mark them as ABANDONED because their original execution
-    did not record a final status.
+    Processing time and peak memory remain NULL because
+    an abandoned execution has no reliable completion metrics.
     """
-
-    from backend.config import STALE_RUN_TIMEOUT_MINUTES
 
     cutoff_time = utc_now() - timedelta(
         minutes=STALE_RUN_TIMEOUT_MINUTES
@@ -152,10 +157,8 @@ def recover_stale_runs(session):
         run.status = "ABANDONED"
         run.completed_at = utc_now()
 
-        if run.processing_time is None and run.started_at:
-            run.processing_time = (
-                run.completed_at - run.started_at
-            ).total_seconds()
+        # Do not calculate processing_time for abandoned runs.
+        # Keep unavailable performance metrics as None.
 
         logger.warning(
             "Recovered stale pipeline run: %s",
@@ -168,15 +171,14 @@ def recover_stale_runs(session):
         session.commit()
 
         logger.info(
-            "Stale pipeline recovery completed. "
-            "Recovered runs: %s",
+            "Stale run recovery completed. Recovered: %s",
             recovered_count
         )
 
     return recovered_count
 
 # ==========================================
-# 4. MAIN PIPELINE
+# 6. MAIN PIPELINE
 # ==========================================
 
 def run_pipeline(
@@ -186,10 +188,6 @@ def run_pipeline(
 
     start_time = time.perf_counter()
 
-    # --------------------------------------
-    # Resolve input paths
-    # --------------------------------------
-
     products_path = Path(
         products_path or SAMPLE_DATA_DIR / "products.csv"
     )
@@ -198,14 +196,25 @@ def run_pipeline(
         orders_path or SAMPLE_DATA_DIR / "orders.json"
     )
 
+    # --------------------------------------
+    # Validate input paths
+    # --------------------------------------
+
     if not products_path.is_file():
         raise FileNotFoundError(products_path)
 
     if not orders_path.is_file():
         raise FileNotFoundError(orders_path)
 
+    # Reject physically empty files before creating a run.
+    if products_path.stat().st_size == 0:
+        raise ValueError("Products CSV file is physically empty.")
+
+    if orders_path.stat().st_size == 0:
+        raise ValueError("Orders JSON file is physically empty.")
+
     # --------------------------------------
-    # Generate execution metadata
+    # Execution metadata
     # --------------------------------------
 
     run_id = str(uuid4())
@@ -227,10 +236,12 @@ def run_pipeline(
 
     with SessionLocal() as session:
 
-        # ==================================
-        # 4.1 CHECK PREVIOUS EXECUTION
-        # ==================================
         recover_stale_runs(session)
+
+        # ==================================
+        # 6.1 IDEMPOTENCY CHECK
+        # ==================================
+
         previous_run = session.scalar(
             select(PipelineRun).where(
                 PipelineRun.file_checksum == checksum,
@@ -251,7 +262,7 @@ def run_pipeline(
             }
 
         # ==================================
-        # 4.2 CREATE PIPELINE RUN
+        # 6.2 CREATE PIPELINE RUN
         # ==================================
 
         create_pipeline_run(
@@ -277,13 +288,18 @@ def run_pipeline(
         try:
 
             # ==================================
-            # 5. PROCESS PRODUCTS
+            # 7. PROCESS PRODUCTS
             # ==================================
 
             logger.info("Starting product processing.")
 
             seen_product_ids = set()
-            valid_product_ids = set()
+
+            # Every valid product in the snapshot.
+            present_product_ids = set()
+
+            # Only ACTIVE products can be purchased.
+            active_product_ids = set()
 
             product_batch_number = 0
 
@@ -298,7 +314,7 @@ def run_pipeline(
                 rejected = []
 
                 # ----------------------------------
-                # VALIDATE AND TRANSFORM PRODUCTS
+                # VALIDATE AND TRANSFORM
                 # ----------------------------------
 
                 for record in batch:
@@ -320,13 +336,16 @@ def run_pipeline(
 
                         continue
 
-                    transformed = transform_product(valid_product)
-
-                    transformed_products.append(transformed)
-
-                    valid_product_ids.add(
-                        valid_product["product_id"]
+                    transformed_products.append(
+                        transform_product(valid_product)
                     )
+
+                    product_id = valid_product["product_id"]
+
+                    present_product_ids.add(product_id)
+
+                    if valid_product["status"] == "ACTIVE":
+                        active_product_ids.add(product_id)
 
                 # ----------------------------------
                 # PUBLISH PRODUCTS
@@ -340,7 +359,7 @@ def run_pipeline(
                 results["valid_records"] += published_count
 
                 # ----------------------------------
-                # STORE REJECTED PRODUCTS
+                # STORE REJECTIONS
                 # ----------------------------------
 
                 rejected_count = publish_rejected_records(
@@ -352,10 +371,6 @@ def run_pipeline(
 
                 results["rejected_records"] += rejected_count
 
-                # ----------------------------------
-                # COMMIT PRODUCT BATCH
-                # ----------------------------------
-
                 session.commit()
 
                 peak_memory_mb = max(
@@ -364,21 +379,51 @@ def run_pipeline(
                 )
 
                 logger.info(
-                    "Product batch %s completed | "
-                    "Valid: %s | Rejected: %s",
+                    "Product batch %s | Valid: %s | Rejected: %s",
                     product_batch_number,
                     published_count,
                     rejected_count
                 )
 
+            # ----------------------------------
+            # PRODUCT SNAPSHOT SAFETY CHECK
+            # ----------------------------------
+
+            if not present_product_ids:
+
+                raise ValueError(
+                    "Product snapshot contains no valid products. "
+                    "Catalogue reconciliation cancelled."
+                )
+
             logger.info(
                 "Product processing completed. "
-                "Valid product IDs: %s",
-                len(valid_product_ids)
+                "Present: %s | Active: %s",
+                len(present_product_ids),
+                len(active_product_ids)
+            )
+
+            # ----------------------------------
+            # RECONCILE PRODUCT SNAPSHOT
+            # ----------------------------------
+
+            reconciled_count = reconcile_product_snapshot(
+                session,
+                present_product_ids,
+                active_product_ids
+            )
+
+            session.commit()
+
+            logger.info(
+                "Product catalogue reconciliation completed. "
+                "Products present: %s | Active: %s",
+                reconciled_count,
+                len(active_product_ids)
             )
 
             # ==================================
-            # 6. PROCESS ORDERS
+            # 8. PROCESS ORDERS
             # ==================================
 
             logger.info("Starting order processing.")
@@ -400,7 +445,7 @@ def run_pipeline(
                 raw_orders_by_id = {}
 
                 # ----------------------------------
-                # VALIDATE AND TRANSFORM ORDERS
+                # VALIDATE AND TRANSFORM
                 # ----------------------------------
 
                 for record in batch:
@@ -410,7 +455,7 @@ def run_pipeline(
                     valid_order, errors = validate_order(
                         record,
                         seen_order_ids,
-                        valid_product_ids
+                        active_product_ids
                     )
 
                     if errors:
@@ -436,7 +481,7 @@ def run_pipeline(
                     ] = record
 
                 # ----------------------------------
-                # BULK PUBLISH ORDERS
+                # BULK PUBLISH
                 # ----------------------------------
 
                 published_count, failed_order_ids = publish_orders(
@@ -461,7 +506,7 @@ def run_pipeline(
                     })
 
                 # ----------------------------------
-                # STORE REJECTED ORDERS
+                # STORE REJECTIONS
                 # ----------------------------------
 
                 rejected_count = publish_rejected_records(
@@ -473,10 +518,6 @@ def run_pipeline(
 
                 results["rejected_records"] += rejected_count
 
-                # ----------------------------------
-                # COMMIT ORDER BATCH
-                # ----------------------------------
-
                 session.commit()
 
                 processed_orders += len(batch)
@@ -487,22 +528,16 @@ def run_pipeline(
                 )
 
                 logger.info(
-                    "Order batch %s completed | "
-                    "Processed: %s | Valid: %s | Rejected: %s",
+                    "Order batch %s | Processed: %s | "
+                    "Valid: %s | Rejected: %s",
                     order_batch_number,
                     processed_orders,
                     published_count,
                     rejected_count
                 )
 
-            logger.info(
-                "Order processing completed. "
-                "Total orders processed: %s",
-                processed_orders
-            )
-
             # ==================================
-            # 7. COMPLETE PIPELINE RUN
+            # 9. COMPLETE PIPELINE
             # ==================================
 
             processing_time = time.perf_counter() - start_time
@@ -536,16 +571,12 @@ def run_pipeline(
             session.commit()
 
             logger.info("Pipeline completed successfully.")
-
-            logger.info(
-                "Final pipeline results: %s",
-                results
-            )
+            logger.info("Final results: %s", results)
 
             return results
 
         # ==================================
-        # 8. HANDLE PIPELINE FAILURE
+        # 10. FAILURE HANDLING
         # ==================================
 
         except BaseException:
@@ -564,14 +595,12 @@ def run_pipeline(
                         time.perf_counter() - start_time
                     ),
                     "peak_memory_mb": peak_memory_mb,
-                    "completed_at": datetime.now()
+                    "completed_at": utc_now()
                 }
             )
 
             session.commit()
 
-            logger.exception(
-                "Pipeline execution failed."
-            )
+            logger.exception("Pipeline execution failed.")
 
             raise
